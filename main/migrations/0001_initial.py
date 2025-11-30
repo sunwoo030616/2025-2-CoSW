@@ -2,8 +2,6 @@
 import django.db.models.deletion
 import pgvector.django.vector
 from django.db import migrations, models
-
-# [중요 1] 이 줄이 꼭 있어야 합니다!
 from pgvector.django import VectorExtension
 
 
@@ -12,7 +10,6 @@ class Migration(migrations.Migration):
     dependencies = []
 
     operations = [
-        # [중요 2] 테이블 만들기 전에 "벡터 기능 켜!" 라고 명령해야 합니다.
         VectorExtension(),
         migrations.CreateModel(
             name="Users",
