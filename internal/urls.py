@@ -1,7 +1,7 @@
 from django.urls import path
-from .views import EmailSendView
+from .views import EmailSendView, FoundItemSyncView
 
 urlpatterns = [
-    # /internal/email/send
     path("email/send", EmailSendView.as_view(), name="email_send"),
+    path("found-items/sync", FoundItemSyncView.as_view(), name="found_items_sync"),
 ]
