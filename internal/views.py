@@ -2,6 +2,7 @@ import requests
 import os
 import random
 import xmltodict
+import urllib3
 from datetime import datetime, timedelta
 from django.utils import timezone
 from django.core.mail import send_mail
@@ -9,7 +10,9 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 from main.models import PoliceFoundItem
-import urllib3
+from main.models import UserLostItem, PoliceFoundItem, NotificationLog
+from pgvector.django import CosineDistance
+from django.db.models import F
 
 # SSL 경고 끄기
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -136,11 +139,11 @@ class FoundItemSyncView(APIView):
                         atc_id=atc_id,
                         fd_sn=fd_sn,
                         defaults={
-                            "item_name": i_name[:195],  # 200자 제한 -> 안전하게 190자
+                            "item_name": i_name[:195],  # 200자 제한 -> 안전하게 195자
                             "item_desc": i_desc,  # TextField
-                            "found_location": i_loc[:195],  # 200자 제한
+                            "found_location": i_loc[:195],  # 195자 제한
                             "found_date": found_date_obj,  # 날짜 객체
-                            "police_image_url": i_img[:495],  # 500자 제한 -> 490자
+                            "police_image_url": i_img[:495],  # 495자 제한 -> 490자
                             "vlm_embedding": get_fake_embedding(),
                         },
                     )
@@ -155,6 +158,111 @@ class FoundItemSyncView(APIView):
                 {"new_items": saved_count, "synced_at": timezone.now().isoformat()},
                 status=200,
             )
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+# POST /internal/matching/daily
+class DailyMatchingView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        try:
+            lost_items = UserLostItem.objects.filter(is_active=True).exclude(
+                vlm_embedding__isnull=True
+            )
+
+            # 테스트용: 1.0 (무조건 매칭), [실전용] 0.25 (유사도 약 75% 이상)
+            SIMILARITY_THRESHOLD = 1.0
+
+            for lost in lost_items:
+                try:
+                    if lost.vlm_embedding is None:
+                        continue
+
+                    try:
+                        user_vector = list(lost.vlm_embedding)
+                    except:
+                        user_vector = lost.vlm_embedding
+
+                    # 유사 습득물 3개
+                    candidates = PoliceFoundItem.objects.annotate(
+                        distance=CosineDistance("vlm_embedding", user_vector)
+                    ).order_by("distance")[:3]
+
+                    valid_matches = []
+                    for item in candidates:
+                        if item.distance is None:
+                            continue
+                        if item.distance > SIMILARITY_THRESHOLD:
+                            continue
+
+                        already_sent = NotificationLog.objects.filter(
+                            user=lost.user,
+                            request=lost,
+                            atc_id=item.atc_id,
+                            fd_sn=item.fd_sn,
+                        ).exists()
+
+                        if not already_sent:
+                            valid_matches.append(item)
+
+                    if not valid_matches:
+                        continue
+
+                    # 이메일 본문
+                    match_list_text = ""
+                    for idx, match in enumerate(valid_matches, 1):
+                        similarity = (1 - match.distance) * 100
+                        match_list_text += f"""
+                        [{idx}번째 후보]
+                        - 물품명: {match.item_name}
+                        - 보관장소: {match.found_location}
+                        - 습득일자: {match.found_date}
+                        - 유사도: {similarity:.1f}%
+                        - 사진 보기: {match.police_image_url}
+                        ----------------------------------------
+                        """
+
+                    subject = f"[Lost112] '{lost.description[:10]}...'와(과) 유사한 물건 {len(valid_matches)}개를 찾았습니다!"
+                    body = f"""
+                    안녕하세요, {lost.user.email}님.
+                    등록하신 분실물과 유사한 습득물이 발견되었습니다.
+                    
+                    ========================================
+                    {match_list_text}
+                    ========================================
+                    """
+
+                    # 이메일 발송
+                    send_mail(
+                        subject=subject,
+                        message=body,
+                        from_email=None,
+                        recipient_list=[lost.user.email],
+                        fail_silently=False,
+                    )
+
+                    # 로그 저장
+                    for match in valid_matches:
+                        NotificationLog.objects.create(
+                            user=lost.user,
+                            request=lost,
+                            atc_id=match.atc_id,
+                            fd_sn=match.fd_sn,
+                            similarity_score=(1 - match.distance),
+                            is_sent=True,
+                        )
+
+                    print(f"[Success] Email sent to {lost.user.email}")
+
+                except Exception as inner_e:
+                    print(f"[Error] Item ID {lost.request_id}: {inner_e}")
+                    continue
+
+            # 성공
+            return Response({"status": "sent"}, status=200)
 
         except Exception as e:
             return Response({"error": str(e)}, status=500)
