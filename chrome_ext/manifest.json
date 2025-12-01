@@ -1,21 +1,29 @@
 {
-    "manifest_version": 3,
-    "name": "Django Extension",
-    "version": "0.1.0",
-    "description": "장고 API와 통신하는 확장 프로그램",
-    "action": {
-        "default_popup": "popup.html",
-        "default_title": "Django Extension"
-    },
-    "permissions": ["storage"],
-    "host_permissions": ["http://127.0.0.1:8000/*", "http://localhost:8000/*"],
-    "background": {
-        "service_worker": "background.js"
-    },
-    "content_scripts": [
-        {
-            "matches": ["<all_urls>"],
-            "js": ["content.js"]
-        }
-    ]
+  "manifest_version": 3,
+  "name": "Lost112 Chatbot",
+  "version": "1.0",
+  "description": "경찰청 유실물 챗봇",
+  "permissions": [],
+  
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["chat_window.html",
+        "chat_window.css",
+        "chat_window.js",
+        "icon.png"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html"
+  }
 }
