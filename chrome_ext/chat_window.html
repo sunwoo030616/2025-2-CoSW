@@ -7,34 +7,34 @@
     <link href="https://fonts.googleapis.com/css2?family=Malgun+Gothic&display=swap" rel="stylesheet"> 
 </head>
 <body>
-    <div id="chatbot-header">
-                        
+    <div id="chatbot-container">
+
+        <div id="chatbot-header">
             <img id="header-icon" src="./header_logo.png" alt="챗봇 로고">
-            
             <div id="header-text-wrapper">
                 <div id="header-text-group">
                     <span id="header-title">경찰청 유실물 챗봇</span>
                     <span id="header-subtitle">LOST112</span>
                 </div>
             </div>
-            
         </div>
 
         <div id="chatbot-messages">
             <div class="bot-message-wrapper">
-                <img class="message-icon" src="./icon.png" alt="봇 아이콘">
+                <img class="message-icon" src="./profile.png" alt="봇 아이콘">
                 <div class="message-bubble">
                     안녕하세요! LOST112 챗봇입니다.<br>무엇을 잃어버리셨나요?
                 </div>
             </div>
-            </div>
+        </div>
 
         <div id="chatbot-input-area">
             <input type="text" id="chat-input" placeholder="메시지 입력..." />
             <button id="attach-button">📎</button>
             <button id="chat-send">▶</button>
         </div>
-    </div>
+
+    </div> <!-- chatbot-container 끝 -->
 
     <script src="chat_window.js"></script> 
 </body>

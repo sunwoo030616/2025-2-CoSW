@@ -9,21 +9,18 @@ html, body {
     overflow: hidden; /* 스크롤바 숨김 */
 }
 
-/* 챗봇 컨테이너 (전체 창을 채움) */
 #chatbot-container {
     display: flex;
     flex-direction: column;
-    height: 100%; /* 팝업 창 높이에 맞춤 */
-    background-color: white;
-    border-radius: 12px;
-    box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
+    height: 100%;
 }
+
 
 /* 헤더 스타일 (상단바) */
 #chatbot-header {
     display: flex;
     /* ⚠️ 왼쪽 정렬을 유지하면서, 로고와 텍스트를 배치합니다. */
-    justify-content: flex-start; 
+    justify-content: center; 
     align-items: center;     
     height: 60px; 
     padding: 5px 20px; 
@@ -64,9 +61,10 @@ html, body {
 #header-text-group {
     display: flex;
     flex-direction: column; 
-    align-items: flex-start; 
+    align-items: center; 
     gap: 2px; /* ⚠️ 텍스트 간격도 줄임 */
     line-height: 1.1;
+    transform: translateX(-12px);
 }
 
 #header-title {
@@ -100,8 +98,8 @@ html, body {
 }
 
 .message-icon {
-    width: 30px;
-    height: 30px;
+    width: 50px;
+    height: 50px;
     border-radius: 50%;
     margin-right: 10px;
     background-color: #fff; /* 아이콘 배경색 */
@@ -113,9 +111,11 @@ html, body {
     border-radius: 18px;
     border-top-left-radius: 2px; /* 봇 메시지 말풍선 꼬리 부분 */
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    border: 2px solid #3e6ab4;
+
     max-width: 80%;
-    font-size: 14px;
-    line-height: 1.4;
+    font-size: 15px;
+    line-height: 1.5;
     color: #333;
 }
 
