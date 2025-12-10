@@ -1,50 +1,34 @@
-import numpy as np
-from django.db import connection
-import json
+import requests
+
+# AI inference server URL
+AI_INFER_URL = "https://jzybnzxdkntxgmhx.tunnel.elice.io/api/v1/infer"
 
 
-# 1) 임베딩 생성 (AI 서버 붙기 전까지 사용)
-def generate_fake_embedding():
-     return np.random.rand(768).tolist()
+def call_ai_similarity(description, image_url=None, top_k=3):
+     """
+     AI inference 서버에 description(or 이미지) 입력하고
+     top_k 만큼 유사한 결과 받아오는 함수
+     """
 
+     payload = {
+          "text": description,
+          "params": {"top_k": top_k}
+     }
 
-# 2) Supabase PostgreSQL pgvector 유사도 검색
-def vector_similarity(vec, top_k=3):
-     db_engine = connection.settings_dict['ENGINE']
+     # 이미지 URL도 필요하면 추가 (AI 개발자와 약속한 스펙에 따라 수정 가능)
+     if image_url:
+          payload["image_url"] = image_url
 
-     if "sqlite" in db_engine:
-          return []
-
-     vec_str = json.dumps(vec)
-
-     with connection.cursor() as cursor:
-          cursor.execute(
-               """
-               SELECT
-                    atc_id,
-                    fd_sn,
-                    item_name,
-                    ai_generated_desc,
-                    police_image_url,
-                    COALESCE(1 - (vlm_embedding <=> %s), 0.0) AS similarity
-               FROM police_found_item
-               WHERE vlm_embedding IS NOT NULL
-               ORDER BY vlm_embedding <=> %s ASC
-               LIMIT %s;
-               """,
-               [vec_str, vec_str, top_k],
+     try:
+          response = requests.post(
+               AI_INFER_URL,
+               headers={"Content-Type": "application/json"},
+               json=payload,
+               timeout=10
           )
-          rows = cursor.fetchall()
+          response.raise_for_status()
+          return response.json()  # 보통 {"results": [ ... ]}
 
-     return [
-          {
-               "atc_id": row[0],
-               "fd_sn": row[1],
-               "item_name": row[2],
-               "ai_generated_desc": row[3],
-               "police_image_url": row[4],
-               "similarity_score": float(row[5]),
-               "detail_link": f"https://www.lost112.go.kr/find/findDetail.do?atcId={row[0]}&fdSn={row[1]}",
-          }
-          for row in rows
-     ]
+     except Exception as e:
+          print("AI 서버 통신 오류:", e)
+          return None
