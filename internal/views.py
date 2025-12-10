@@ -10,14 +10,11 @@ from django.core.mail import send_mail
 
 # 모델 및 유틸 함수
 from main.models import PoliceFoundItem, UserLostItem, NotificationLog
-from main.utils import send_new_item_to_ai, get_search_results_from_ai
+from main.utils import send_police_data_to_ai, get_search_results_from_ai
 
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# 경찰청에서는 이미지가 없을 경우 이미지 없음 이미지가 들어가서 이를 처리하기 위함
-NO_IMG_URL = "https://www.lost112.go.kr/lostnfs/images/sub/img02_no_img.gif"
 
 
 # POST /internal/email/send
@@ -112,15 +109,13 @@ class FoundItemSyncView(APIView):
                     except:
                         pass
 
-                # 이미지 필터링
+                # [수정] 이미지 필터링 로직 제거 -> 있는 그대로 저장
                 raw_img_url = item.get("fdFilePathImg", "")
-                final_img_url = raw_img_url
+                final_img_url = None
 
-                # GIF URL과 동일하면 -> None 처리
-                if not raw_img_url or raw_img_url == NO_IMG_URL:
-                    final_img_url = None
-                else:
-                    final_img_url = raw_img_url[:490]  # DB 길이 제한 고려
+                if raw_img_url:
+                    # DB varchar(500) 제한만 고려하여 자름
+                    final_img_url = raw_img_url[:490]
 
                 # DB 저장 (Upsert)
                 obj, created = PoliceFoundItem.objects.update_or_create(
@@ -131,14 +126,17 @@ class FoundItemSyncView(APIView):
                         "item_desc": item.get("fdSbjt", ""),
                         "found_location": item.get("depPlace", "")[:190],
                         "found_date": found_date,
-                        "police_image_url": final_img_url,  # 필터링된 URL 저장
+                        "police_image_url": final_img_url,  # 필터링 없이 그대로 저장
+                        # 경찰청 원본 데이터를 통째로 JSONField에 저장
+                        "raw_data": item,
                     },
                 )
 
-                # 신규 데이터라면 AI로 전송 : utils.py에서 police_image_url이 None이면 자동으로 이미지 전송을 안 함
+                # 신규 데이터라면 AI로 전송
                 if created:
                     saved_count += 1
-                    if send_new_item_to_ai(obj):
+                    # 원본 딕셔너리(item) 전송 (utils에서 URL 추출해서 보냄)
+                    if send_police_data_to_ai(item):
                         sent_ai_count += 1
 
             return Response(
@@ -167,7 +165,7 @@ class DailyMatchingView(APIView):
 
         for lost_req in active_requests:
             try:
-                # 검색 수행 (utils 함수 사용 향후 대체 함수로 변경)
+                # 검색 수행 (Multipart 방식 유지)
                 ai_results = get_search_results_from_ai(None, lost_req.description)
                 if not ai_results:
                     continue
