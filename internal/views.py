@@ -2,22 +2,22 @@ import requests
 import os
 import xmltodict
 from datetime import datetime, timedelta
+import urllib3
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 
 from django.core.mail import send_mail
+from django.db import connection
 
-# 모델 및 유틸 함수
 from main.models import PoliceFoundItem, UserLostItem, NotificationLog
-from main.utils import send_police_data_to_ai, get_search_results_from_ai
-
-import urllib3
+from main.utils import ai_infer, send_police_data_to_ai
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# POST /internal/email/send
+# 1. 이메일 발송 (유틸성 뷰)
 class EmailSendView(APIView):
     permission_classes = [AllowAny]
 
@@ -42,7 +42,7 @@ class EmailSendView(APIView):
             return Response({"error": str(e)}, status=500)
 
 
-# POST /internal/found-items/sync
+# 2. 경찰청 데이터 동기화 (크롤러 역할)
 class FoundItemSyncView(APIView):
     permission_classes = [AllowAny]
 
@@ -99,23 +99,27 @@ class FoundItemSyncView(APIView):
                 if not atc_id:
                     continue
 
-                # 날짜 변환
+                # --- [날짜 변환 및 포맷 강제 적용] ---
                 fd_ymd = item.get("fdYmd")
                 found_date = None
+
                 if fd_ymd:
                     try:
+                        # 하이픈 유무 확인 후 날짜 객체 변환
                         fmt = "%Y-%m-%d" if "-" in fd_ymd else "%Y%m%d"
-                        found_date = datetime.strptime(fd_ymd, fmt).date()
-                    except:
+                        dt_obj = datetime.strptime(fd_ymd, fmt).date()
+
+                        # (1) DB 저장용 (Python Date 객체)
+                        found_date = dt_obj
+
+                        # (2) AI 전송용 (YYYY-MM-DD 문자열로 강제 변환)
+                        item["fdYmd"] = dt_obj.strftime("%Y-%m-%d")
+                    except Exception:
                         pass
+                # ------------------------------------
 
-                # [수정] 이미지 필터링 로직 제거 -> 있는 그대로 저장
                 raw_img_url = item.get("fdFilePathImg", "")
-                final_img_url = None
-
-                if raw_img_url:
-                    # DB varchar(500) 제한만 고려하여 자름
-                    final_img_url = raw_img_url[:490]
+                final_img_url = raw_img_url[:490] if raw_img_url else None
 
                 # DB 저장 (Upsert)
                 obj, created = PoliceFoundItem.objects.update_or_create(
@@ -126,16 +130,15 @@ class FoundItemSyncView(APIView):
                         "item_desc": item.get("fdSbjt", ""),
                         "found_location": item.get("depPlace", "")[:190],
                         "found_date": found_date,
-                        "police_image_url": final_img_url,  # 필터링 없이 그대로 저장
-                        # 경찰청 원본 데이터를 통째로 JSONField에 저장
+                        "police_image_url": final_img_url,
                         "raw_data": item,
                     },
                 )
 
-                # 신규 데이터라면 AI로 전송
+                # 신규 데이터라면 AI로 전송 (utils 함수 사용)
                 if created:
                     saved_count += 1
-                    # 원본 딕셔너리(item) 전송 (utils에서 URL 추출해서 보냄)
+                    # item['fdYmd']는 위에서 "2025-12-11" 포맷으로 변경됨
                     if send_police_data_to_ai(item):
                         sent_ai_count += 1
 
@@ -154,8 +157,7 @@ class FoundItemSyncView(APIView):
             return Response({"error": str(e)}, status=500)
 
 
-# POST /internal/matching/daily
-# 사용자가 액티브 상태일 때: AI 검색 -> 중복(Log) 제외 -> 새로운 매칭 발견 시 이메일 발송
+# 3. 데일리 매칭 (Batch Job)
 class DailyMatchingView(APIView):
     permission_classes = [AllowAny]
 
@@ -163,21 +165,26 @@ class DailyMatchingView(APIView):
         # 1. 활성화된 요청 조회
         active_requests = UserLostItem.objects.filter(is_active=True)
 
+        processed_count = 0
+        email_sent_count = 0
+
         for lost_req in active_requests:
             try:
-                # 검색 수행 (Multipart 방식 유지)
-                ai_results = get_search_results_from_ai(None, lost_req.description)
+                # [설정] AI Infer 호출 (Top 3)
+                ai_results = ai_infer(lost_req.description, top_k=3)
+
                 if not ai_results:
                     continue
 
                 new_matches = []
 
-                # 중복 알림 방지 필터링
-                for match in ai_results:
-                    match_id = str(match.get("id"))
+                # 중복 알림 방지 및 필터링
+                for idx, match in enumerate(ai_results):
+                    # 필드 매핑
+                    match_id = str(match.get("atcId"))
+                    match_name = match.get("fdPrdtNm", "이름 없음")
                     score = match.get("score", 0)
-                    rank = match.get("rank", 0)
-                    text = match.get("text", "")
+                    rank = idx + 1  # 1위, 2위, 3위...
 
                     # DB 로그 확인
                     already_sent = NotificationLog.objects.filter(
@@ -187,19 +194,26 @@ class DailyMatchingView(APIView):
                     # 보낸 적 없다면 리스트에 추가
                     if not already_sent:
                         new_matches.append(
-                            {"id": match_id, "score": score, "rank": rank, "text": text}
+                            {
+                                "id": match_id,
+                                "name": match_name,
+                                "score": score,
+                                "rank": rank,
+                            }
                         )
 
-                # 새로운 매칭 결과가 있다면 이메일 무조건 발송
+                # 새로운 매칭 결과가 있다면 이메일 발송
                 if new_matches:
                     email_subject = (
                         f"[Lost112] '{lost_req.description}' 관련 습득물 알림"
                     )
-                    email_body = f"안녕하세요.\n요청하신 분실물 '{lost_req.description}' 과 유사한 습득물이 발견되었습니다.\n\n"
 
+                    email_body = f"안녕하세요.\n요청하신 '{lost_req.description}'과 유사한 습득물이 발견되었습니다.\n\n"
                     for item in new_matches:
-                        email_body += f"[{item['rank']}위] 유사도: {item['score']}\n"
-                        email_body += f"- 물품명: {item['text']}\n"
+                        email_body += (
+                            f"[{item['rank']}위] 유사도: {item['score']:.2f}\n"
+                        )
+                        email_body += f"- 물품명: {item['name']}\n"
                         email_body += f"- 관리번호: {item['id']}\n"
                         email_body += "--------------------------------\n"
 
@@ -214,9 +228,9 @@ class DailyMatchingView(APIView):
                             recipient_list=[lost_req.user.email],
                             fail_silently=False,
                         )
-                        print(f"📧 Sent to {lost_req.user.email}")
+                        email_sent_count += 1
 
-                        # 발송 성공 시 로그 저장 (중복 방지용)
+                        # 발송 성공 시 로그 저장
                         for item in new_matches:
                             NotificationLog.objects.create(
                                 user=lost_req.user,
@@ -230,8 +244,17 @@ class DailyMatchingView(APIView):
                     except Exception as e:
                         print(f"Email Error ({lost_req.user.email}): {e}")
 
+                processed_count += 1
+
             except Exception as e:
                 print(f"Matching Error ({lost_req.request_id}): {e}")
                 continue
 
-        return Response({"status": "Job Done"}, status=200)
+        return Response(
+            {
+                "status": "Job Done",
+                "processed_requests": processed_count,
+                "emails_sent": email_sent_count,
+            },
+            status=200,
+        )
