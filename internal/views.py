@@ -1,28 +1,23 @@
 import requests
 import os
-import random
 import xmltodict
-import urllib3
 from datetime import datetime, timedelta
-from django.utils import timezone
-from django.core.mail import send_mail
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
-from main.models import PoliceFoundItem
-from main.models import UserLostItem, PoliceFoundItem, NotificationLog
-from pgvector.django import CosineDistance
-from django.db.models import F
 
-# SSL 경고 끄기
+from django.core.mail import send_mail
+
+# 모델 및 유틸 함수
+from main.models import PoliceFoundItem, UserLostItem, NotificationLog
+from main.utils import send_police_data_to_ai, get_search_results_from_ai
+
+import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# [가짜 AI 함수]
-def get_fake_embedding():
-    return [random.random() for _ in range(768)]
-
-
+# POST /internal/email/send
 class EmailSendView(APIView):
     permission_classes = [AllowAny]
 
@@ -31,11 +26,9 @@ class EmailSendView(APIView):
         subject = request.data.get("subject")
         body = request.data.get("body")
 
-        # 필수 값 체크
         if not recipient or not subject or not body:
             return Response({"error": "to, subject, body are required"}, status=400)
 
-        # 이메일 전송 로직
         try:
             send_mail(
                 subject=subject,
@@ -55,107 +48,105 @@ class FoundItemSyncView(APIView):
 
     def post(self, request):
         api_key = os.getenv("POLICE_API_KEY")
-
         if not api_key:
-            return Response({"error": "POLICE_API_KEY not found in .env"}, status=500)
-        base_url = "http://apis.data.go.kr/1320000/LosfundInfoInqireService/getLosfundInfoAccToClAreaPd"
+            return Response({"error": "POLICE_API_KEY is missing"}, status=500)
 
-        # 날짜 계산 (Ai 연결 후 30일치 받고 1일로 변경)
+        # 1. 파라미터 파싱
+        days_ago = int(request.data.get("days", 1))
+        num_rows = int(request.data.get("rows", 1000))
+        page_no = int(request.data.get("page", 1))
+
         today = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=14)).strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
 
+        # 2. 경찰청 API 호출
+        base_url = "http://apis.data.go.kr/1320000/LosfundInfoInqireService/getLosfundInfoAccToClAreaPd"
         params = {
             "serviceKey": api_key,
             "START_YMD": start_date,
             "END_YMD": today,
-            "numOfRows": "20",  # 20개 가져옴 - 추후 갯수 변경예정
-            "pageNo": "1",
+            "numOfRows": str(num_rows),
+            "pageNo": str(page_no),
         }
 
-        # 요청
         try:
             response = requests.get(base_url, params=params, verify=False)
 
-            if response.status_code != 200:
-                return Response(
-                    {
-                        "error": f"API Error: {response.status_code}",
-                        "detail": response.text,
-                    },
-                    status=502,
-                )
-
-            # 데이터 파싱 - JSON 시도 후 XML
+            # 3. XML 파싱
             items_list = []
             try:
-                data = response.json()
-                items_body = data["response"]["body"]["items"]
-                if items_body:
-                    items_list = items_body["item"]
+                data_dict = xmltodict.parse(response.content)
+                items_wrapper = (
+                    data_dict.get("response", {}).get("body", {}).get("items")
+                )
+                if items_wrapper:
+                    items_list = items_wrapper.get("item")
             except Exception:
-                try:
-                    data_dict = xmltodict.parse(response.content)
-                    response_body = data_dict.get("response", {}).get("body", {})
-                    items_wrapper = response_body.get("items")
-                    if items_wrapper:
-                        items_list = items_wrapper.get("item")
-                except Exception as e:
-                    return Response(
-                        {"error": "Parsing Failed", "detail": str(e)}, status=502
-                    )
+                pass
 
-            # 리스트 정규화
             if isinstance(items_list, dict):
                 items_list = [items_list]
             elif items_list is None:
                 items_list = []
 
             saved_count = 0
+            sent_ai_count = 0
 
-            # DB 저장
+            # 4. 데이터 처리 루프
             for item in items_list:
-                try:
-                    atc_id = item.get("atcId")
-                    fd_sn = item.get("fdSn")
-
-                    if not atc_id or not fd_sn:
-                        continue
-
-                    fd_ymd_str = item.get("fdYmd")
-                    found_date_obj = None
-                    if fd_ymd_str:
-                        try:
-                            fmt = "%Y-%m-%d" if "-" in fd_ymd_str else "%Y%m%d"
-                            found_date_obj = datetime.strptime(fd_ymd_str, fmt).date()
-                        except ValueError:
-                            found_date_obj = None
-
-                    i_name = item.get("fdPrdtNm", "이름 없음") or ""
-                    i_desc = item.get("fdSbjt", "") or ""
-                    i_loc = item.get("depPlace", "") or ""
-                    i_img = item.get("fdFilePathImg", "") or ""
-
-                    obj, created = PoliceFoundItem.objects.update_or_create(
-                        atc_id=atc_id,
-                        fd_sn=fd_sn,
-                        defaults={
-                            "item_name": i_name[:195],  # 200자 제한 -> 안전하게 195자
-                            "item_desc": i_desc,  # TextField
-                            "found_location": i_loc[:195],  # 195자 제한
-                            "found_date": found_date_obj,  # 날짜 객체
-                            "police_image_url": i_img[:495],  # 495자 제한 -> 490자
-                            "vlm_embedding": get_fake_embedding(),
-                        },
-                    )
-                    if created:
-                        saved_count += 1
-
-                except Exception as db_err:
-                    print(f"저장 실패 ({atc_id}): {db_err}")
+                atc_id = item.get("atcId")
+                fd_sn = item.get("fdSn")
+                if not atc_id:
                     continue
 
+                # 날짜 변환
+                fd_ymd = item.get("fdYmd")
+                found_date = None
+                if fd_ymd:
+                    try:
+                        fmt = "%Y-%m-%d" if "-" in fd_ymd else "%Y%m%d"
+                        found_date = datetime.strptime(fd_ymd, fmt).date()
+                    except:
+                        pass
+
+                # [수정] 이미지 필터링 로직 제거 -> 있는 그대로 저장
+                raw_img_url = item.get("fdFilePathImg", "")
+                final_img_url = None
+
+                if raw_img_url:
+                    # DB varchar(500) 제한만 고려하여 자름
+                    final_img_url = raw_img_url[:490]
+
+                # DB 저장 (Upsert)
+                obj, created = PoliceFoundItem.objects.update_or_create(
+                    atc_id=atc_id,
+                    fd_sn=fd_sn,
+                    defaults={
+                        "item_name": item.get("fdPrdtNm", "")[:190],
+                        "item_desc": item.get("fdSbjt", ""),
+                        "found_location": item.get("depPlace", "")[:190],
+                        "found_date": found_date,
+                        "police_image_url": final_img_url,  # 필터링 없이 그대로 저장
+                        # 경찰청 원본 데이터를 통째로 JSONField에 저장
+                        "raw_data": item,
+                    },
+                )
+
+                # 신규 데이터라면 AI로 전송
+                if created:
+                    saved_count += 1
+                    # 원본 딕셔너리(item) 전송 (utils에서 URL 추출해서 보냄)
+                    if send_police_data_to_ai(item):
+                        sent_ai_count += 1
+
             return Response(
-                {"new_items": saved_count, "synced_at": timezone.now().isoformat()},
+                {
+                    "message": "Daily Sync Complete",
+                    "date_range": f"{start_date} ~ {today}",
+                    "total_fetched": len(items_list),
+                    "new_db_saved": saved_count,
+                    "sent_to_ai": sent_ai_count,
+                },
                 status=200,
             )
 
@@ -164,105 +155,83 @@ class FoundItemSyncView(APIView):
 
 
 # POST /internal/matching/daily
+# 사용자가 액티브 상태일 때: AI 검색 -> 중복(Log) 제외 -> 새로운 매칭 발견 시 이메일 발송
 class DailyMatchingView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        try:
-            lost_items = UserLostItem.objects.filter(is_active=True).exclude(
-                vlm_embedding__isnull=True
-            )
+        # 1. 활성화된 요청 조회
+        active_requests = UserLostItem.objects.filter(is_active=True)
 
-            # 테스트용: 1.0 (무조건 매칭), [실전용] 0.25 (유사도 약 75% 이상)
-            SIMILARITY_THRESHOLD = 1.0
-
-            for lost in lost_items:
-                try:
-                    if lost.vlm_embedding is None:
-                        continue
-
-                    try:
-                        user_vector = list(lost.vlm_embedding)
-                    except:
-                        user_vector = lost.vlm_embedding
-
-                    # 유사 습득물 3개
-                    candidates = PoliceFoundItem.objects.annotate(
-                        distance=CosineDistance("vlm_embedding", user_vector)
-                    ).order_by("distance")[:3]
-
-                    valid_matches = []
-                    for item in candidates:
-                        if item.distance is None:
-                            continue
-                        if item.distance > SIMILARITY_THRESHOLD:
-                            continue
-
-                        already_sent = NotificationLog.objects.filter(
-                            user=lost.user,
-                            request=lost,
-                            atc_id=item.atc_id,
-                            fd_sn=item.fd_sn,
-                        ).exists()
-
-                        if not already_sent:
-                            valid_matches.append(item)
-
-                    if not valid_matches:
-                        continue
-
-                    # 이메일 본문
-                    match_list_text = ""
-                    for idx, match in enumerate(valid_matches, 1):
-                        similarity = (1 - match.distance) * 100
-                        match_list_text += f"""
-                        [{idx}번째 후보]
-                        - 물품명: {match.item_name}
-                        - 보관장소: {match.found_location}
-                        - 습득일자: {match.found_date}
-                        - 유사도: {similarity:.1f}%
-                        - 사진 보기: {match.police_image_url}
-                        ----------------------------------------
-                        """
-
-                    subject = f"[Lost112] '{lost.description[:10]}...'와(과) 유사한 물건 {len(valid_matches)}개를 찾았습니다!"
-                    body = f"""
-                    안녕하세요, {lost.user.email}님.
-                    등록하신 분실물과 유사한 습득물이 발견되었습니다.
-                    
-                    ========================================
-                    {match_list_text}
-                    ========================================
-                    """
-
-                    # 이메일 발송
-                    send_mail(
-                        subject=subject,
-                        message=body,
-                        from_email=None,
-                        recipient_list=[lost.user.email],
-                        fail_silently=False,
-                    )
-
-                    # 로그 저장
-                    for match in valid_matches:
-                        NotificationLog.objects.create(
-                            user=lost.user,
-                            request=lost,
-                            atc_id=match.atc_id,
-                            fd_sn=match.fd_sn,
-                            similarity_score=(1 - match.distance),
-                            is_sent=True,
-                        )
-
-                    print(f"[Success] Email sent to {lost.user.email}")
-
-                except Exception as inner_e:
-                    print(f"[Error] Item ID {lost.request_id}: {inner_e}")
+        for lost_req in active_requests:
+            try:
+                # 검색 수행 (Multipart 방식 유지)
+                ai_results = get_search_results_from_ai(None, lost_req.description)
+                if not ai_results:
                     continue
 
-            # 성공
-            return Response({"status": "sent"}, status=200)
+                new_matches = []
 
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
+                # 중복 알림 방지 필터링
+                for match in ai_results:
+                    match_id = str(match.get("id"))
+                    score = match.get("score", 0)
+                    rank = match.get("rank", 0)
+                    text = match.get("text", "")
+
+                    # DB 로그 확인
+                    already_sent = NotificationLog.objects.filter(
+                        request=lost_req, atc_id=match_id, is_sent=True
+                    ).exists()
+
+                    # 보낸 적 없다면 리스트에 추가
+                    if not already_sent:
+                        new_matches.append(
+                            {"id": match_id, "score": score, "rank": rank, "text": text}
+                        )
+
+                # 새로운 매칭 결과가 있다면 이메일 무조건 발송
+                if new_matches:
+                    email_subject = (
+                        f"[Lost112] '{lost_req.description}' 관련 습득물 알림"
+                    )
+                    email_body = f"안녕하세요.\n요청하신 분실물 '{lost_req.description}' 과 유사한 습득물이 발견되었습니다.\n\n"
+
+                    for item in new_matches:
+                        email_body += f"[{item['rank']}위] 유사도: {item['score']}\n"
+                        email_body += f"- 물품명: {item['text']}\n"
+                        email_body += f"- 관리번호: {item['id']}\n"
+                        email_body += "--------------------------------\n"
+
+                    email_body += "\n경찰청 유실물 포털(Lost112)에서 관리번호로 검색하여 상세 정보를 확인하세요."
+
+                    # [실제 발송]
+                    try:
+                        send_mail(
+                            subject=email_subject,
+                            message=email_body,
+                            from_email=None,
+                            recipient_list=[lost_req.user.email],
+                            fail_silently=False,
+                        )
+                        print(f"📧 Sent to {lost_req.user.email}")
+
+                        # 발송 성공 시 로그 저장 (중복 방지용)
+                        for item in new_matches:
+                            NotificationLog.objects.create(
+                                user=lost_req.user,
+                                request=lost_req,
+                                atc_id=item["id"],
+                                rank=item["rank"],
+                                similarity_score=item["score"],
+                                is_sent=True,
+                            )
+
+                    except Exception as e:
+                        print(f"Email Error ({lost_req.user.email}): {e}")
+
+            except Exception as e:
+                print(f"Matching Error ({lost_req.request_id}): {e}")
+                continue
+
+        return Response({"status": "Job Done"}, status=200)
