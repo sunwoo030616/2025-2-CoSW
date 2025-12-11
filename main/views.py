@@ -5,6 +5,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.parsers import MultiPartParser, FormParser
+from .utils import *
 
 from .models import *
 from .serializers import *
@@ -52,31 +53,30 @@ class LostItemCreateView(APIView):
         image = serializer.validated_data.get("image")
         description = serializer.validated_data.get("description")
 
-        # TODO: S3 업로드 예정 → 현재는 로컬 경로 저장
         image_url = None
         if image:
             image_url = f"/uploads/{image.name}"
 
-        # DB 저장 (embedding은 None)
         lost_item = UserLostItem.objects.create(
             user=request.user,
             description=description,
             original_image_url=image_url,
-            vlm_embedding=None
         )
 
-        # AI inference 서버에 유사도 검색 요청
-        ai_results = call_ai_similarity(
-            description=description,
-            image_url=image_url,
-            top_k=3
-        )
+        # --- AI 결과 가져오기 ---
+        ai_results = ai_infer(description, top_k=3)
 
-        # AI 서버 응답 처리
-        matches = []
-        if ai_results:
-            # AI 팀이 JSON을 {"results": [...]} 형태로 준다는 전제
-            matches = ai_results.get("results", ai_results)
+        # --- 프론트에서 필요한 형태로 변환 ---
+        formatted = []
+        for item in ai_results[:3]:
+            formatted.append({
+                "title": item.get("fdPrdtNm"),
+                "image": item.get("fdFilePathImg"),
+                "place": item.get("depPlace"),
+                "date": item.get("fdYmd"),
+                "detail_link": f"https://www.lost112.go.kr/find/findDetail.do?atcId={item.get('atcId')}",
+                "score": item.get("score"),
+            })
 
         return Response(
             {
@@ -87,10 +87,11 @@ class LostItemCreateView(APIView):
                     "is_active": lost_item.is_active,
                     "created_at": lost_item.created_at,
                 },
-                "immediate_matches": matches,
+                "immediate_matches": formatted,
             },
             status=status.HTTP_201_CREATED
         )
+
 
 
 # GET 사용자가 등록한 아이템 목록
