@@ -11,11 +11,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const imageInput = document.getElementById("image-input");
     const imagePreviewBox = document.getElementById("image-preview-box");
 
-    let selectedImageFile = null;   // ← 선택된 단일 이미지 저장
+    let selectedImageFile = null;
 
 
     /* ============================================================
-       EMAIL LOGIN / REGISTER 부분 (그대로 유지)
+       EMAIL LOGIN / REGISTER
     ============================================================ */
 
     const LOGIN_ENDPOINT = 'http://127.0.0.1:8000/auth/login';
@@ -107,22 +107,23 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({ email })
             });
 
-            if (!res.ok) {
-                errorField.innerText = "회원가입 실패했습니다.";
-                errorField.style.display = "block";
+            if (res.ok) {
+                res = await fetch(LOGIN_ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email })
+                });
+
+                const data = await res.json();
+                saveAuth(data);
+                appendBotMessage("회원가입 완료! 로그인되었습니다.");
+                finishEmailInput();
                 return;
             }
 
-            res = await fetch(LOGIN_ENDPOINT, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ email })
-            });
+            errorField.innerText = "회원가입 실패했습니다.";
+            errorField.style.display = "block";
 
-            const data = await res.json();
-            saveAuth(data);
-            appendBotMessage("회원가입 완료! 로그인되었습니다.");
-            finishEmailInput();
         } catch (e) {
             console.error(e);
             errorField.innerText = "서버 오류가 발생했습니다.";
@@ -183,7 +184,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     /* ============================================================
-       ✉️ 메시지 전송 (텍스트 + 이미지 동시)
+       ✉️ 메시지 전송
     ============================================================ */
 
     function sendMessage() {
@@ -223,14 +224,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     /* ============================================================
-       🔥 POST /items (텍스트 + 이미지 지원)
+       🔥 POST /items
     ============================================================ */
     async function handleUserLostItem(text, imageFile) {
         const token = localStorage.getItem("access_token");
-        if (!token) {
-            appendBotMessage("로그인 후 이용해주세요.");
-            return;
-        }
+        if (!token) return appendBotMessage("로그인 후 이용해주세요.");
 
         const formData = new FormData();
         if (text) formData.append("description", text);
@@ -254,7 +252,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     /* ============================================================
-       🎯 매칭 UI
+       🎯 매칭 결과 UI
     ============================================================ */
     function appendMatchResult(data) {
         const wrapper = document.createElement("div");
@@ -263,27 +261,33 @@ document.addEventListener('DOMContentLoaded', () => {
         let html = `
             <img class="message-icon" src="./profile.png">
             <div class="message-bubble">
-                입력하신 정보와 유사한 분실물 ${data.immediate_matches.length}건을 찾았어요.<br>
+                가장 유사한 분실물 3건을 찾았어요.<br>
                 아래에서 확인해주세요.<br><br>
                 <div class="match-container">
         `;
 
         data.immediate_matches.forEach(item => {
+            // BE 제공 스키마에 맞춰 사용: title, image, place, detail_link
+            const imgUrl = item.image || null;
+            const name = item.title || "(항목명 없음)";
+            const desc = item.place || "";
+            const date = item.date ? ` · 접수일: ${escapeHtml(item.date)}` : "";
+
             html += `
                 <div class="match-card" data-detail="${item.detail_link}">
-                    <img src="${item.police_image_url}" class="match-img">
-                    <div class="match-name">${item.item_name}</div>
-                    <div class="match-desc">${item.ai_generated_desc}</div>
+                    ${imgUrl ? `<img src="${imgUrl}" class="match-img">` : ``}
+                    <div class="match-name">${escapeHtml(name)}</div>
+                    <div class="match-desc">${escapeHtml(desc)}${date}</div>
                 </div>
             `;
         });
 
         html += `
                 </div>
-                <button class="no-item-button">제 물건이 없어요</button>
-                <button class="found-button" data-request-id="${data.registered_item.request_id}">
-                    찾았어요 (알림 중지)
-                </button>
+                <div class="match-actions">
+                    <button class="btn-outline no-item-button">제 물건이 없어요 (알림 받기)</button>
+                    <button class="btn-primary found-button" data-request-id="${data.registered_item.request_id}">찾았어요 (알림 중지)</button>
+                </div>
             </div>
         `;
 
@@ -294,7 +298,245 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     /* ============================================================
-       🔕 PATCH /items/cease/{id}
+       이미지 URL 변환 함수
+    ============================================================ */
+    function resolveImageUrl(url) {
+        if (!url) return null;
+
+        // 절대 URL 이면 그대로 사용
+        if (url.startsWith("http")) return url;
+
+        // 백엔드가 "/uploads/파일명.png" 처럼 상대 경로를 준 경우
+        // 한글/공백/특수문자 포함 파일명을 안전하게 인코딩
+        try {
+            const encodedPath = encodeURI(url);
+            return `http://127.0.0.1:8000${encodedPath}`;
+        } catch {
+            return `http://127.0.0.1:8000${url}`;
+        }
+    }
+
+    // 안전한 이미지 URL 반환 (없으면 기본 이미지)
+    function safeImage(url) {
+        const resolved = resolveImageUrl(url);
+        return resolved || "./profile.png";
+    }
+
+
+    /* ============================================================
+       📋 사용자 분실물 목록 조회
+    ============================================================ */
+    async function fetchUserItemsList() {
+        const token = localStorage.getItem("access_token");
+
+        try {
+            const res = await fetch("http://127.0.0.1:8000/items/list", {
+                method: "GET",
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+
+            const data = await res.json();
+            renderUserItemsList(data.items || []);
+
+        } catch (err) {
+            console.error(err);
+            appendBotMessage("서버 오류가 발생했습니다.");
+        }
+    }
+
+
+    /* ============================================================
+       목록 렌더링 (match-card → user-item-card로 분리)
+    ============================================================ */
+    function renderUserItemsList(items) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "bot-message-wrapper";
+
+        let html = `
+            <img class="message-icon" src="./profile.png">
+            <div class="message-bubble">
+                나의 분실물 목록 (${items.length}개)<br><br>
+                <div class="match-container">
+        `;
+
+        if (!items.length) {
+            html += `등록된 분실물이 없습니다.`;
+        } else {
+            items.forEach(item => {
+
+                const imgUrl = resolveImageUrl(item.original_image_url);
+
+                // 상태 텍스트: 항상 진행중으로 표시
+                const statusText = "진행중";
+
+                html += `
+                    <div class="user-item-card" data-request-id="${item.request_id}">
+                        ${imgUrl ? `<img src="${imgUrl}" class="match-img">` : `<div class="user-item-placeholder">LOST112</div>`}
+
+                        <div class="match-name">${escapeHtml(item.description || "(설명 없음)")}</div>
+                        <div class="match-desc">
+                            상태: ${statusText} · 등록일: ${formatDate(item.created_at)}
+                        </div>
+                `;
+
+                // 진행중일 때만 알림 중지 버튼 표시
+                html += `
+                        <button class="cease-button" data-request-id="${item.request_id}">
+                            알림 중지
+                        </button>
+                `;
+
+                html += `</div>`;
+            });
+        }
+
+        html += `
+                </div>
+            </div>
+        `;
+
+        wrapper.innerHTML = html;
+        messages.appendChild(wrapper);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+
+
+    /* ============================================================
+       헬퍼 함수
+    ============================================================ */
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function formatDate(iso) {
+        if (!iso) return "-";
+        try {
+            const d = new Date(iso);
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        } catch {
+            return iso;
+        }
+    }
+    
+
+    function formatDate(iso) {
+        if (!iso) return "-";
+        try {
+            const d = new Date(iso);
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        } catch {
+            return iso;
+        }
+    }
+    function renderHelpCard() {
+        const wrapper = document.createElement("div");
+        wrapper.className = "bot-message-wrapper help-anim-wrapper";
+
+        wrapper.innerHTML = `
+            <img class="message-icon" src="./profile.png">
+            <div class="help-card slide-in">
+
+                <div class="help-title">🧭 도움말 안내</div>
+
+                <div class="help-item">
+                    <span class="help-icon">🔍</span>
+                    <div class="help-text">
+                        <div class="help-head">분실물 찾기</div>
+                        <div class="help-desc">물건 설명 또는 사진을 보내면 AI가 가장 유사한 습득물을 자동으로 찾아드립니다.</div>
+                    </div>
+                </div>
+
+                <div class="help-item">
+                    <span class="help-icon">📁</span>
+                    <div class="help-text">
+                        <div class="help-head">내 분실물 목록</div>
+                        <div class="help-desc">내가 등록한 분실물 기록 확인 및 알림 상태를 관리할 수 있어요.</div>
+                    </div>
+                </div>
+
+                <div class="help-item">
+                    <span class="help-icon">📸</span>
+                    <div class="help-text">
+                        <div class="help-head">사진 첨부</div>
+                        <div class="help-desc">사진을 함께 보내면 AI가 색상·형태를 분석해 더 정확한 매칭을 제공합니다.</div>
+                    </div>
+                </div>
+
+                <div class="help-item">
+                    <span class="help-icon">🔔</span>
+                    <div class="help-text">
+                        <div class="help-head">알림 기능</div>
+                        <div class="help-desc">유사한 습득물이 접수되면 자동으로 이메일로 알려드립니다.</div>
+                    </div>
+                </div>
+
+            </div>
+        `;
+
+        messages.appendChild(wrapper);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+
+
+
+
+    /* ============================================================
+       클릭 이벤트 (목록 카드 / 매칭 카드 분리)
+    ============================================================ */
+    document.addEventListener("click", (e) => {
+        // 버튼/액션 우선 처리
+        if (e.target.classList.contains("cease-button")) {
+            stopNotification(e.target.dataset.requestId);
+            return;
+        }
+        if (e.target.classList.contains("list-button")) {
+            fetchUserItemsList();
+            return;
+        }
+        if (e.target.classList.contains("found-button")) {
+            stopNotification(e.target.dataset.requestId);
+            return;
+        }
+        if (e.target.classList.contains("no-item-button")) {
+            appendBotMessage("걱정마세요! 유사한 물건이 등록되는 즉시 이메일로 알려드릴게요.");
+            return;
+        }
+
+        // 🔵 목록 카드 클릭은 아무 동작도 하지 않음 (버튼 제외)
+        if (e.target.closest(".user-item-card")) {
+            return;
+        }
+
+        // 🟡 경찰청 매칭 카드
+        if (e.target.closest(".match-card")) {
+            const url = e.target.closest(".match-card").dataset.detail;
+            if (url) window.open(url, "_blank");
+            return;
+        }
+    });
+    const openListBtn = document.getElementById("open-list");
+    if (openListBtn) {
+        openListBtn.addEventListener("click", () => {
+            fetchUserItemsList();
+        });
+    }
+
+    const openHelpBtn = document.getElementById("open-help");
+    if (openHelpBtn) {
+        openHelpBtn.addEventListener("click", () => {
+            renderHelpCard();
+        });
+    }
+
+    /* ============================================================
+       PATCH /items/cease
     ============================================================ */
     async function stopNotification(requestId) {
         const token = localStorage.getItem("access_token");
@@ -306,36 +548,26 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             const data = await res.json();
-            appendBotMessage(data.message);
+            appendBotMessage(data.message || "알림이 중지되었습니다.");
+
+            // UI 즉시 반영: 해당 카드 상태를 '찾음'으로 변경하고 버튼 제거
+            const card = document.querySelector(`.user-item-card[data-request-id='${requestId}']`);
+            if (card) {
+                const descEl = card.querySelector('.match-desc');
+                if (descEl) {
+                    // 기존 '상태: 진행중 · 등록일: yyyy-mm-dd' 문구에서 상태만 교체
+                    const text = descEl.textContent;
+                    const replaced = text.replace(/상태:\s*진행중/, '상태: 찾음');
+                    descEl.textContent = replaced;
+                }
+                const ceaseBtn = card.querySelector('.cease-button');
+                if (ceaseBtn) ceaseBtn.remove();
+            }
 
         } catch (err) {
             console.error(err);
             appendBotMessage("알림 중지에 실패했습니다.");
         }
     }
-
-
-    /* ============================================================
-       전역 클릭 이벤트 처리
-    ============================================================ */
-    document.addEventListener("click", (e) => {
-
-        if (e.target.closest(".match-card")) {
-            const url = e.target.closest(".match-card").dataset.detail;
-            window.open(url, "_blank");
-            return;
-        }
-
-        if (e.target.classList.contains("no-item-button")) {
-            appendBotMessage("걱정마세요! 유사한 물건이 등록되는 즉시 이메일로 알려드릴게요.");
-            return;
-        }
-
-        if (e.target.classList.contains("found-button")) {
-            const requestId = e.target.dataset.requestId;
-            stopNotification(requestId);
-            return;
-        }
-    });
 
 });
